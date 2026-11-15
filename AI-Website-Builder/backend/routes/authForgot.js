@@ -23,8 +23,8 @@ router.post("/request", async (req, res, next) => {
         .json({ error: "No account found with that email." });
 
     const code = generateOtp();
-    saveOtp(email, code);
-    await sendOtpEmail({ to: user.email, name: user.name, code });
+    await saveOtp("reset", email, code);
+    await sendOtpEmail({ to: user.email, name: user.name, code, purpose: "reset" });
 
     res.json({ ok: true, email: user.email });
   } catch (err) {
@@ -46,7 +46,7 @@ router.post("/verify-code", async (req, res, next) => {
         .status(404)
         .json({ error: "No account found with that email." });
 
-    const result = peekOtp(email, code);
+    const result = await peekOtp("reset", email, code);
     if (!result.ok) return res.status(400).json({ error: result.reason });
 
     res.json({ ok: true });
@@ -60,8 +60,8 @@ router.post("/verify-code", async (req, res, next) => {
 router.post("/reset", async (req, res, next) => {
   try {
     const {email, code, newPassword} = req.body;
-    if (!email || !code)
-      return res.status(400).json({ error: "Email and code are required." });
+   if (!email || !code || !newPassword)
+      return res.status(400).json({ error: "Email, code and new password are required." });
 
     if (newPassword.length < 6)
       return res
@@ -74,7 +74,7 @@ router.post("/reset", async (req, res, next) => {
         .status(404)
         .json({ error: "No account found with that email." });
 
-    const result = verifyOtp(email, code);
+      const result = await verifyOtp("reset", email, code);
     if (!result.ok) return res.status(400).json({ error: result.reason });
 
     user.passwordHash = await User.hashPassword(newPassword);
