@@ -12,6 +12,8 @@ import {
 } from "./llm.js";
 import Stripe from "stripe";
 import { Octokit } from "@octokit/rest";
+import crypto from "crypto";
+import { Otp } from "../models/Otp.js";
 
 // ═══════════ AI GENERATION ═══════════
 
@@ -446,56 +448,109 @@ function renderEmailHtml({ name, code, intro }) {
 </body></html>`;
 }
 
-// ═══════════ OTP STORE (in-memory) ═══════════
+// ═══════════ OTP STORE (MongoDB + TTL) ═══════════
 
-// Simple in-memory OTP store. Codes are 6-digit, plain, and expire in 10 min.
-// Kept deliberately simple (no crypto / no DB fields) — codes live in a Map
-// keyed by email. Good enough for this project; restart clears pending codes.
+// Codes live in the `otps` collection, so they survive restarts and are shared
+// by every server instance. Only an HMAC of the code is stored, each code
+// allows MAX_ATTEMPTS checks, and MongoDB deletes expired codes automatically.
 
-const otpStore = new Map();
 const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const MAX_ATTEMPTS = 5;
 
-// Generate a random 6-digit OTP string.
-export const generateOtp = () =>
-  String(Math.floor(100000 + Math.random() * 900000));
+// One document per purpose + normalised email, e.g. "signup:akarsh@gmail.com".
+const otpKey = (purpose, email) =>
+  `${purpose}:${String(email || "").trim().toLowerCase()}`;
 
-// Save a code for an email (overwrites any previous one).
-export function saveOtp(email, code) {
-  otpStore.set(email, { code, expiresAt: Date.now() + OTP_TTL_MS });
+// HMAC with a server secret: a 6-digit code has only 900,000 values, so a plain
+// SHA-256 could be reversed by trying them all if the database leaked.
+function hashOtp(code) {
+  const secret = process.env.OTP_SECRET || process.env.JWT_SECRET;
+  if (!secret) throw new Error("OTP_SECRET or JWT_SECRET must be set");
+  return crypto
+    .createHmac("sha256", secret)
+    .update(String(code ?? "").trim())
+    .digest("hex");
 }
 
-// Verify a code. On success the code is burned so it can't be reused.
-export function verifyOtp(email, code) {
-  const record = otpStore.get(email);
+// Constant-time comparison, so response timing reveals nothing about the code.
+function sameHash(a, b) {
+  const x = Buffer.from(a, "hex");
+  const y = Buffer.from(b, "hex");
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+// Cryptographically secure random 6-digit code (100000–999999).
+export const generateOtp = () => String(crypto.randomInt(100000, 1000000));
+
+// Save a code (replaces any earlier code for the same purpose + email).
+export async function saveOtp(purpose, email, code) {
+  await Otp.findOneAndUpdate(
+    { key: otpKey(purpose, email) },
+    {
+      codeHash: hashOtp(code),
+      attempts: 0,
+      expiresAt: new Date(Date.now() + OTP_TTL_MS),
+    },
+    { upsert: true, setDefaultsOnInsert: true },
+  );
+}
+
+// Shared check used by verifyOtp (burns the code) and peekOtp (keeps it).
+async function checkOtp(purpose, email, code, { burn }) {
+  const key = otpKey(purpose, email);
+
+  // Atomically use up one attempt. Matches nothing if the code is missing,
+  // expired or out of attempts, so parallel guesses can't exceed the limit.
+  const record = await Otp.findOneAndUpdate(
+    { key, expiresAt: { $gt: new Date() }, attempts: { $lt: MAX_ATTEMPTS } },
+    { $inc: { attempts: 1 } },
+    { new: true },
+  );
+
   if (!record) {
-    return { ok: false, reason: "No code requested. Request a new one." };
+    const existing = await Otp.findOne({ key }).lean();
+    if (!existing)
+      return { ok: false, reason: "No code requested. Request a new one." };
+    await Otp.deleteOne({ key });
+    return {
+      ok: false,
+      reason:
+        existing.attempts >= MAX_ATTEMPTS
+          ? "Too many attempts. Request a new code."
+          : "Code expired. Request a new one.",
+    };
   }
-  if (Date.now() > record.expiresAt) {
-    otpStore.delete(email);
-    return { ok: false, reason: "Code expired. Request a new one." };
+
+  if (!sameHash(record.codeHash, hashOtp(code))) {
+    const left = MAX_ATTEMPTS - record.attempts;
+    return {
+      ok: false,
+      reason:
+        left > 0
+          ? `Incorrect code. ${left} attempt${left === 1 ? "" : "s"} left.`
+          : "Too many attempts. Request a new code.",
+    };
   }
-  if (record.code !== String(code).trim()) {
-    return { ok: false, reason: "Incorrect code." };
+
+  if (burn) {
+    // findOneAndDelete is atomic: if two requests race, only one gets the document.
+    const used = await Otp.findOneAndDelete({ _id: record._id });
+    if (!used) return { ok: false, reason: "Code already used. Request a new one." };
+  } else {
+    // A correct peek shouldn't count against the user.
+    await Otp.updateOne({ _id: record._id }, { $inc: { attempts: -1 } });
   }
-  otpStore.delete(email);
   return { ok: true };
 }
 
-// Check a code WITHOUT burning it — used to gate the "set a new password" step
-// so the same code can still be used by the final reset call.
-export function peekOtp(email, code) {
-  const record = otpStore.get(email);
-  if (!record)
-    return { ok: false, reason: "No code requested. Request a new one." };
-  if (Date.now() > record.expiresAt) {
-    otpStore.delete(email);
-    return { ok: false, reason: "Code expired. Request a new one." };
-  }
-  if (record.code !== String(code).trim())
-    return { ok: false, reason: "Incorrect code." };
-  return { ok: true };
-}
+// Verify a code. On success the code is deleted so it can't be reused.
+export const verifyOtp = (purpose, email, code) =>
+  checkOtp(purpose, email, code, { burn: true });
 
+// Check a code WITHOUT deleting it — the forgot-password flow checks it in
+// step 2 and uses it for real in step 3.
+export const peekOtp = (purpose, email, code) =>
+  checkOtp(purpose, email, code, { burn: false });
 // ═══════════ STRIPE PAYMENTS ═══════════
 
 // Stripe SDK wrapper. Reads STRIPE_SECRET_KEY from env. Keeps just what we
