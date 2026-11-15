@@ -363,13 +363,18 @@ function parseBrevoError(status, body) {
 export async function sendOtpEmail({ to, name, code, purpose }) {
   // Subject + intro varies by purpose so users know what the email is for
   // (signup verification, login OTP, password recovery, etc.).
-  const isSignup = purpose === "signup";
+    const isSignup = purpose === "signup";
+  const isReset = purpose === "reset";
   const subject = isSignup
     ? `Verify your mintsite account — code: ${code}`
-    : `Your mintsite code: ${code}`;
+    : isReset
+      ? `Reset your mintsite password — code: ${code}`
+      : `Your mintsite code: ${code}`;
   const intro = isSignup
     ? "Welcome to mintsite! Use this code to verify your email and finish signing up."
-    : "Enter this code to sign in. It expires in 10 minutes.";
+    : isReset
+      ? "Use this code to reset your password. It expires in 10 minutes."
+      : "Enter this code to sign in. It expires in 10 minutes.";
   const textContent = `Hi ${name || "there"},\n\n${intro}\n\nYour code: ${code}\n\nThis code expires in 10 minutes.\nIf you didn't request this, you can safely ignore this email.\n\n— mintsite`;
   const htmlContent = renderEmailHtml({ name, code, intro });
 
