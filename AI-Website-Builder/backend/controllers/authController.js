@@ -11,13 +11,16 @@ import {
   verifyOtp,
 } from "../utils/services.js";
 
-// Issue an OTP for an email and send it. Returns the standard payload.
-async function issueAndSend(email, name, status, res, code = 201) {
+// in issueAndSend — rename the 3rd parameter to purpose, then:
+async function issueAndSend(email, name, purpose, res, code = 201) {
   const otp = generateOtp();
-  saveOtp(email, otp);
-  await sendOtpEmail({ to: email, name, code: otp, purpose: status });
+  await saveOtp(purpose, email, otp);
+  await sendOtpEmail({ to: email, name, code: otp, purpose });
   return res.status(code).json({ ok: true, email });
 }
+
+// in verifyRegister
+const result = await verifyOtp("signup", email, code);
 
 // Sign up a new user, or re-send OTP if the email exists but is unverified.
 export async function register(req, res, next) {
