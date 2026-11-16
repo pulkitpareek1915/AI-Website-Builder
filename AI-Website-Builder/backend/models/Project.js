@@ -28,18 +28,8 @@ const projectSchema = new mongoose.Schema(
     published: { type: Boolean, default: false, index: true },
     publishedAt: { type: Date, default: null },
     messages: { type: [messageSchema], default: [] },
-    views: { type: Number, default: 0 },
-    likes: { type: Number, default: 0 },
-    viewedBy: {
-      type: [mongoose.Schema.Types.ObjectId],
-      default: [],
-      select: false,
-    },
-    likedBy: {
-      type: [mongoose.Schema.Types.ObjectId],
-      default: [],
-      select: false,
-    },
+     views: { type: Number, default: 0, min: 0 },
+    likes: { type: Number, default: 0, min: 0 },
     // For real Vercel deployments
     deployUrl: { type: String, default: "" },
     deployedAt: { type: Date, default: null },
