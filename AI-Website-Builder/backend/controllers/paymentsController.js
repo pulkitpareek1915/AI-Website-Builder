@@ -1,4 +1,6 @@
 import { Payment } from "../models/Payment.js";
+import { User } from "../models/User.js";
+import { withTransaction } from "../utils/tx.js";
 import {
   createCheckoutSession,
   retrieveSession,
@@ -106,23 +108,40 @@ export async function verifySession(req, res, next) {
         user: req.user.toClient(),
       });
     }
-    const session = await retrieveSession(sessionId);
-    if (session.payment_status !== "paid") {
+    const stripeSession = await retrieveSession(sessionId);
+    if (stripeSession.payment_status !== "paid") {
       return res.status(400).json({ error: "Payment not completed yet" });
     }
-    payment.stripePaymentIntentId = session.payment_intent;
-    payment.status = "paid";
-    await payment.save();
     const creditsToAdd = Number(payment.creditsPurchased);
     if (!Number.isFinite(creditsToAdd) || creditsToAdd <= 0) {
       return res.status(500).json({ error: "Invalid creditsPurchased value on payment record." });
     }
-    req.user.credits = (req.user.credits || 0) + creditsToAdd;
-    await req.user.save();
+
+    // Flip the payment to "paid" and add the credits as ONE unit:
+    // - the filter status != "paid" lets only the FIRST of several parallel
+    //   requests match, so the same payment can never be credited twice;
+    // - the transaction makes both writes commit together or not at all;
+    // - $inc adds to the balance inside MongoDB (no stale read-modify-write).
+    const credited = await withTransaction(async (session) => {
+      const flipped = await Payment.findOneAndUpdate(
+        { _id: payment._id, status: { $ne: "paid" } },
+        { $set: { status: "paid", stripePaymentIntentId: stripeSession.payment_intent } },
+        { new: true, session },
+      );
+      if (!flipped) return false; // another request already credited it
+      await User.updateOne(
+        { _id: req.user._id },
+        { $inc: { credits: creditsToAdd } },
+        { session },
+      );
+      return true;
+    });
+
+    const freshUser = await User.findById(req.user._id);
     res.json({
       ok: true,
-      creditsAdded: payment.creditsPurchased,
-      user: req.user.toClient(),
+      ...(credited ? { creditsAdded: creditsToAdd } : { alreadyCredited: true }),
+      user: freshUser.toClient(),
     });
   } catch (err) {
     next(err);
