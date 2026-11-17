@@ -3,6 +3,11 @@
 
 import { User } from "../models/User.js";
 import { Project } from "../models/Project.js";
+import { Payment } from "../models/Payment.js";
+import { Like } from "../models/Like.js";
+import { View } from "../models/View.js";
+import { Otp } from "../models/Otp.js";
+import { withTransaction } from "../utils/tx.js";
 import { signToken } from "../middleware/auth.js";
 import {
   sendOtpEmail,
@@ -11,16 +16,13 @@ import {
   verifyOtp,
 } from "../utils/services.js";
 
-// in issueAndSend — rename the 3rd parameter to purpose, then:
+// Issue an OTP for an email and send it. Returns the standard payload.
 async function issueAndSend(email, name, purpose, res, code = 201) {
   const otp = generateOtp();
   await saveOtp(purpose, email, otp);
   await sendOtpEmail({ to: email, name, code: otp, purpose });
   return res.status(code).json({ ok: true, email });
 }
-
-// in verifyRegister
-const result = await verifyOtp("signup", email, code);
 
 // Sign up a new user, or re-send OTP if the email exists but is unverified.
 export async function register(req, res, next) {
@@ -71,7 +73,7 @@ export async function verifyRegister(req, res, next) {
     if (user.emailVerified)
       return res.json({ ok: true, alreadyVerified: true });
 
-    const result = verifyOtp(email, code);
+    const result = await verifyOtp("signup", email, code);
     if (!result.ok) return res.status(400).json({ error: result.reason });
 
     user.emailVerified = true;
@@ -215,8 +217,40 @@ export async function changePassword(req, res, next) {
 // Delete the logged-in user's account along with all of their projects.
 export async function deleteAccount(req, res, next) {
   try {
-    await Project.deleteMany({ user: req.user._id });
-    await req.user.deleteOne();
+    const userId = req.user._id;
+    const email = req.user.email;
+
+    // MongoDB has no ON DELETE CASCADE, so delete everything that belongs to the
+    // user here, in one transaction: all of it goes, or (on an error) none of it.
+    await withTransaction(async (session) => {
+      const projectIds = (
+        await Project.find({ user: userId }, { _id: 1 }, { session }).lean()
+      ).map((p) => p._id);
+
+      // Likes/views BY this user, and likes/views ON this user's projects.
+      const byOrOn = { $or: [{ user: userId }, { project: { $in: projectIds } }] };
+      await Like.deleteMany(byOrOn, { session });
+      await View.deleteMany(byOrOn, { session });
+
+      await Project.deleteMany({ user: userId }, { session });
+
+      // Payments are business records (accounting/tax), so keep them but
+      // detach them from the deleted account instead of deleting them.
+      await Payment.updateMany(
+        { user: userId },
+        { $set: { user: null, userDeleted: true } },
+        { session },
+      );
+
+      // Any pending email codes for this address.
+      await Otp.deleteMany(
+        { key: { $in: [`signup:${email}`, `reset:${email}`] } },
+        { session },
+      );
+
+      await User.deleteOne({ _id: userId }, { session });
+    });
+
     res.json({ ok: true });
   } catch (err) {
     next(err);
