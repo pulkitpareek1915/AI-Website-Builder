@@ -13,7 +13,7 @@ const paymentSchema = new mongoose.Schema(
     creditsPurchased: { type: Number, required: true, min: 0 },
     amount: { type: Number, required: true, min: 0 },
     currency: { type: String, default: "usd" },
-    stripeSessionId: { type: String, required: true, index: true },
+    stripeSessionId: { type: String, required: true, unique: true },
     stripePaymentIntentId: { type: String, default: null },
 
     status: {
